@@ -124,6 +124,7 @@ function useCredentialEnv(): void {
 
 interface HttpResult {
   status: number;
+  headers: Record<string, string | string[] | undefined>;
   body: string;
 }
 
@@ -149,6 +150,7 @@ function sendHttp(options: {
         res.on("end", () => {
           resolve({
             status: res.statusCode ?? 0,
+            headers: res.headers,
             body: Buffer.concat(chunks).toString("utf8"),
           });
         });
@@ -578,6 +580,25 @@ describe("Entra OAuth replaces S2S in env mode only", () => {
     });
     expect(response.status).toBe(200);
     expect(getConfigCalls.n).toBe(1);
+  });
+
+  it("env mode: a rejected bearer gets a WWW-Authenticate invalid_token challenge", async () => {
+    const port = await startOauth("env");
+    resetCredentialSpies();
+
+    const response = await sendHttp({
+      port,
+      method: "POST",
+      path: "/mcp",
+      headers: mcpHeaders({ authorization: "Bearer not.a.valid-jwt" }),
+      body: toolsListBody,
+    });
+    expect(response.status).toBe(401);
+    expect(response.headers["www-authenticate"]).toBe(
+      'Bearer error="invalid_token", resource_metadata="https://mcp.example.invalid/.well-known/oauth-protected-resource"',
+    );
+    expect(getConfigCalls.n).toBe(0);
+    expect(constructed).toEqual([]);
   });
 
   it("gateway mode: S2S is still required even with OAuth on", async () => {

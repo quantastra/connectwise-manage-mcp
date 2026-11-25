@@ -357,7 +357,15 @@ export async function startHttpTransport(): Promise<HttpServer> {
             );
           } catch (err) {
             if (err instanceof AuthError) {
-              res.writeHead(err.statusCode, { "Content-Type": "application/json" });
+              // RFC 6750 §3: a rejected bearer token gets a WWW-Authenticate
+              // challenge so MCP clients refresh (or re-run discovery) instead
+              // of treating the 401 as a dead connection.
+              const headers: Record<string, string> = { "Content-Type": "application/json" };
+              if (err.statusCode === 401) {
+                headers["WWW-Authenticate"] =
+                  `Bearer error="invalid_token", resource_metadata="${entraConfig.serverUrl}/.well-known/oauth-protected-resource"`;
+              }
+              res.writeHead(err.statusCode, headers);
               res.end(JSON.stringify({ error: "auth_failed", message: err.message }));
             } else {
               console.error("[auth] Unexpected validation error:", err);

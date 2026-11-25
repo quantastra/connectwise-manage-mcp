@@ -56,6 +56,11 @@ const ENV_KEYS = [
   "CW_MANAGE_CLIENT_ID",
   "CW_MANAGE_URL",
   "CW_MANAGE_REJECT_UNAUTHORIZED",
+  "AZURE_TENANT_ID",
+  "AZURE_CLIENT_ID",
+  "AZURE_AUDIENCE",
+  "MCP_SERVER_URL",
+  "MCP_BEARER_TOKEN",
 ] as const;
 
 const savedEnv = new Map<string, string | undefined>();
@@ -119,6 +124,7 @@ function useCredentialEnv(): void {
 
 interface HttpResult {
   status: number;
+  headers: Record<string, string | string[] | undefined>;
   body: string;
 }
 
@@ -144,6 +150,7 @@ function sendHttp(options: {
         res.on("end", () => {
           resolve({
             status: res.statusCode ?? 0,
+            headers: res.headers,
             body: Buffer.concat(chunks).toString("utf8"),
           });
         });
@@ -520,5 +527,99 @@ describe("env-mode HTTP still requires S2S", () => {
     ]);
     expect(response.body).not.toContain("header-company-must-not-be-used");
     expect(response.body).not.toContain(S2S_SECRET);
+  });
+});
+
+describe("Entra OAuth replaces S2S in env mode only", () => {
+  const STATIC_BEARER = "static-bearer-for-test-4b1e";
+
+  async function startOauth(authMode: "env" | "gateway"): Promise<number> {
+    process.env.CONDUIT_S2S_SECRET = S2S_SECRET;
+    delete process.env.MCP_ALLOW_INSECURE_DEV;
+    process.env.MCP_HTTP_HOST = "127.0.0.1";
+    process.env.AUTH_MODE = authMode;
+    useCredentialEnv(); // clears MCP_OAUTH_ENABLED, so set it after
+    process.env.MCP_OAUTH_ENABLED = "true";
+    process.env.AZURE_TENANT_ID = "00000000-0000-0000-0000-000000000000";
+    process.env.AZURE_CLIENT_ID = "11111111-1111-1111-1111-111111111111";
+    process.env.AZURE_AUDIENCE = "api://test-audience";
+    process.env.MCP_SERVER_URL = "https://mcp.example.invalid";
+    process.env.MCP_BEARER_TOKEN = STATIC_BEARER;
+    captureStderr(); // keep [auth]/[audit] startup lines out of test output
+    return (await listen()).port;
+  }
+
+  it("env mode: no S2S header and no bearer gets the OAuth 401, not the S2S 401", async () => {
+    const port = await startOauth("env");
+    resetCredentialSpies();
+
+    const response = await sendHttp({
+      port,
+      method: "POST",
+      path: "/mcp",
+      headers: mcpHeaders(),
+      body: toolsListBody,
+    });
+    expect(response.status).toBe(401);
+    expect(response.body).toContain("Bearer token required");
+    expect(response.body).not.toContain("X-Gateway-S2S");
+    expect(getConfigCalls.n).toBe(0);
+    expect(constructed).toEqual([]);
+  });
+
+  it("env mode: a valid bearer without an S2S header is accepted", async () => {
+    const port = await startOauth("env");
+    resetCredentialSpies();
+
+    const response = await sendHttp({
+      port,
+      method: "POST",
+      path: "/mcp",
+      headers: mcpHeaders({ authorization: `Bearer ${STATIC_BEARER}` }),
+      body: toolsListBody,
+    });
+    expect(response.status).toBe(200);
+    expect(getConfigCalls.n).toBe(1);
+  });
+
+  it("env mode: a rejected bearer gets a WWW-Authenticate invalid_token challenge", async () => {
+    const port = await startOauth("env");
+    resetCredentialSpies();
+
+    const response = await sendHttp({
+      port,
+      method: "POST",
+      path: "/mcp",
+      headers: mcpHeaders({ authorization: "Bearer not.a.valid-jwt" }),
+      body: toolsListBody,
+    });
+    expect(response.status).toBe(401);
+    expect(response.headers["www-authenticate"]).toBe(
+      'Bearer error="invalid_token", resource_metadata="https://mcp.example.invalid/.well-known/oauth-protected-resource"',
+    );
+    expect(getConfigCalls.n).toBe(0);
+    expect(constructed).toEqual([]);
+  });
+
+  it("gateway mode: S2S is still required even with OAuth on", async () => {
+    const port = await startOauth("gateway");
+    resetCredentialSpies();
+
+    const response = await sendHttp({
+      port,
+      method: "POST",
+      path: "/mcp",
+      headers: mcpHeaders({
+        authorization: `Bearer ${STATIC_BEARER}`,
+        "x-cw-company-id": "header-company",
+        "x-cw-public-key": "header-public",
+        "x-cw-private-key": "header-private",
+        "x-cw-client-id": "header-client",
+      }),
+      body: toolsListBody,
+    });
+    expect(response.status).toBe(401);
+    expect(response.body).toContain("X-Gateway-S2S");
+    expect(constructed).toEqual([]);
   });
 });

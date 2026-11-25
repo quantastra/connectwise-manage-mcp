@@ -280,9 +280,15 @@ export async function startHttpTransport(): Promise<HttpServer> {
     // MCP endpoint - stateless: fresh server + transport per request
     if (url.pathname === "/mcp") {
       // Empty s2sSecret is only reachable when MCP_ALLOW_INSECURE_DEV=1;
-      // startup refuses otherwise. A configured secret is always enforced,
-      // before any credential extraction.
-      if (s2sSecret && !verifyS2sHeader(headerValue(req.headers[S2S_HEADER]), s2sSecret)) {
+      // startup refuses otherwise. A configured secret is enforced before
+      // any credential extraction, with one exception: env mode with Entra
+      // OAuth on. There the Entra bearer token (checked below) is the
+      // request auth, and CW credentials come from the server's own env, so
+      // direct clients such as a Claude.ai custom connector (which cannot
+      // mint the gateway HMAC) can connect. Gateway mode always requires
+      // S2S, because it trusts caller-supplied X-CW-* credential headers.
+      const s2sRequired = s2sSecret && !(oauthEnabled && !isGatewayMode);
+      if (s2sRequired && !verifyS2sHeader(headerValue(req.headers[S2S_HEADER]), s2sSecret)) {
         res.writeHead(401, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({
@@ -351,7 +357,15 @@ export async function startHttpTransport(): Promise<HttpServer> {
             );
           } catch (err) {
             if (err instanceof AuthError) {
-              res.writeHead(err.statusCode, { "Content-Type": "application/json" });
+              // RFC 6750 §3: a rejected bearer token gets a WWW-Authenticate
+              // challenge so MCP clients refresh (or re-run discovery) instead
+              // of treating the 401 as a dead connection.
+              const headers: Record<string, string> = { "Content-Type": "application/json" };
+              if (err.statusCode === 401) {
+                headers["WWW-Authenticate"] =
+                  `Bearer error="invalid_token", resource_metadata="${entraConfig.serverUrl}/.well-known/oauth-protected-resource"`;
+              }
+              res.writeHead(err.statusCode, headers);
               res.end(JSON.stringify({ error: "auth_failed", message: err.message }));
             } else {
               console.error("[auth] Unexpected validation error:", err);
